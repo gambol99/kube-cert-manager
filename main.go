@@ -55,18 +55,20 @@ func (lf *listFlag) Set(s string) error {
 func main() {
 	// Parse command line
 	var (
-		kubeconfig       string
-		acmeURL          string
-		syncInterval     int
-		certSecretPrefix string
-		dataDir          string
-		certNamespace    string
-		tagPrefix        string
-		namespaces       []string
-		class            string
-		defaultProvider  string
-		defaultEmail     string
-		renewBeforeDays  int
+		kubeconfig        string
+		acmeURL           string
+		syncInterval      int
+		certSecretPrefix  string
+		dataDir           string
+		certNamespace     string
+		tagPrefix         string
+		namespaces        []string
+		class             string
+		defaultProvider   string
+		defaultEmail      string
+		defaultBackoff    time.Duration
+		defaultMaxBackoff time.Duration
+		renewBeforeDays   int
 	)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "The kubeconfig to use; if empty the in-cluster config will be used")
@@ -79,6 +81,8 @@ func main() {
 	flag.Var((*listFlag)(&namespaces), "namespaces", "Comma-separated list of namespaces to monitor. The empty list means all namespaces")
 	flag.StringVar(&class, "class", "default", "Class label for resources managed by this certificate manager")
 	flag.StringVar(&defaultProvider, "default-provider", "", "Default handler to handle ACME challenges")
+	flag.DurationVar(&defaultBackoff, "default-backoff", time.Duration(0), "The backoff duration on certificate errors, defaults to none")
+	flag.DurationVar(&defaultMaxBackoff, "default-max-backoff", 3*time.Hour, "The maximum backoff time will are willing to wait on failed cerficate requests")
 	flag.StringVar(&defaultEmail, "default-email", "", "Default email address for ACME registrations")
 	flag.IntVar(&renewBeforeDays, "renew-before-days", 7, "Renew certificates before this number of days until expiry")
 	flag.Parse()
@@ -162,7 +166,8 @@ func main() {
 	}
 
 	// Create the processor
-	p := NewCertProcessor(k8sClient, certClient, acmeURL, certSecretPrefix, certNamespace, tagPrefix, namespaces, class, defaultProvider, defaultEmail, db, renewBeforeDays)
+	p := NewCertProcessor(k8sClient, certClient, acmeURL, certSecretPrefix, certNamespace, tagPrefix, namespaces,
+		class, defaultBackoff, defaultMaxBackoff, defaultProvider, defaultEmail, db, renewBeforeDays)
 
 	// Asynchronously start watching and refreshing certs
 	wg := sync.WaitGroup{}

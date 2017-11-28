@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/boltdb/bolt"
+	"github.com/jpillora/backoff"
 	"github.com/pkg/errors"
 	"github.com/xenolf/lego/acme"
 	"github.com/xenolf/lego/providers/dns/cloudflare"
@@ -53,22 +54,35 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+// certBackoff
+type certBackoff struct {
+	// Permitted is time we can retry the request
+	Permitted time.Time
+	// Rate is the backoff implementation
+	Rate *backoff.Backoff
+}
+
 // CertProcessor holds the shared configuration, state, and locks
 type CertProcessor struct {
-	acmeURL          string
-	certSecretPrefix string
-	certNamespace    string
-	tagPrefix        string
-	namespaces       []string
-	class            string
-	defaultProvider  string
-	defaultEmail     string
-	db               *bolt.DB
-	Lock             sync.Mutex
-	HTTPLock         sync.Mutex
-	TLSLock          sync.Mutex
-	k8s              K8sClient
-	renewBeforeDays  int
+	HTTPLock sync.Mutex
+	Lock     sync.Mutex
+	TLSLock  sync.Mutex
+	rateLock sync.RWMutex
+
+	acmeURL           string
+	certNamespace     string
+	certSecretPrefix  string
+	class             string
+	db                *bolt.DB
+	defaultBackoff    time.Duration
+	defaultEmail      string
+	defaultMaxBackoff time.Duration
+	defaultProvider   string
+	k8s               K8sClient
+	namespaces        []string
+	rateLimits        map[string]*certBackoff
+	renewBeforeDays   int
+	tagPrefix         string
 }
 
 // NewCertProcessor creates and populates a CertProcessor
@@ -81,85 +95,28 @@ func NewCertProcessor(
 	tagPrefix string,
 	namespaces []string,
 	class string,
+	defaultBackoff time.Duration,
+	defaultMaxBackoff time.Duration,
 	defaultProvider string,
 	defaultEmail string,
 	db *bolt.DB,
 	renewBeforeDays int) *CertProcessor {
+
 	return &CertProcessor{
-		k8s:              K8sClient{c: k8s, certClient: certClient},
-		acmeURL:          acmeURL,
-		certSecretPrefix: certSecretPrefix,
-		certNamespace:    certNamespace,
-		tagPrefix:        tagPrefix,
-		namespaces:       namespaces,
-		class:            class,
-		defaultProvider:  defaultProvider,
-		defaultEmail:     defaultEmail,
-		db:               db,
-		renewBeforeDays:  renewBeforeDays,
-	}
-}
-
-func (p *CertProcessor) newACMEClient(acmeUser acme.User, provider string) (*acme.Client, *sync.Mutex, error) {
-	acmeClient, err := acme.NewClient(p.acmeURL, acmeUser, acme.RSA2048)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "Error while generating acme client")
-	}
-
-	initDNSProvider := func(p acme.ChallengeProvider, err error) (*acme.Client, *sync.Mutex, error) {
-		if err != nil {
-			return nil, nil, errors.Wrapf(err, "Error while initializing challenge provider %v", provider)
-		}
-
-		if err := acmeClient.SetChallengeProvider(acme.DNS01, p); err != nil {
-			return nil, nil, errors.Wrapf(err, "Error while setting challenge provider %v for dns-01", provider)
-		}
-
-		acmeClient.ExcludeChallenges([]acme.Challenge{acme.HTTP01, acme.TLSSNI01})
-		return acmeClient, nil, nil
-	}
-
-	switch provider {
-	case "http":
-		acmeClient.SetHTTPAddress(":8080")
-		acmeClient.ExcludeChallenges([]acme.Challenge{acme.DNS01, acme.TLSSNI01})
-		return acmeClient, &p.HTTPLock, nil
-	case "tls":
-		acmeClient.SetTLSAddress(":8081")
-		acmeClient.ExcludeChallenges([]acme.Challenge{acme.HTTP01, acme.DNS01})
-		return acmeClient, &p.TLSLock, nil
-	case "cloudflare":
-		return initDNSProvider(cloudflare.NewDNSProvider())
-	case "digitalocean":
-		return initDNSProvider(digitalocean.NewDNSProvider())
-	case "dnsimple":
-		return initDNSProvider(dnsimple.NewDNSProvider())
-	case "dnsmadeeasy":
-		return initDNSProvider(dnsmadeeasy.NewDNSProvider())
-	case "dnspod":
-		return initDNSProvider(dnspod.NewDNSProvider())
-	case "dyn":
-		return initDNSProvider(dyn.NewDNSProvider())
-	case "gandi":
-		return initDNSProvider(gandi.NewDNSProvider())
-	case "googlecloud":
-		return initDNSProvider(googlecloud.NewDNSProvider())
-	case "linode":
-		return initDNSProvider(linode.NewDNSProvider())
-	case "namecheap":
-		return initDNSProvider(namecheap.NewDNSProvider())
-	case "ovh":
-		return initDNSProvider(ovh.NewDNSProvider())
-	case "pdns":
-		return initDNSProvider(pdns.NewDNSProvider())
-	case "rfc2136":
-		return initDNSProvider(rfc2136.NewDNSProvider())
-	case "route53":
-		return initDNSProvider(route53.NewDNSProvider())
-	case "vultr":
-		return initDNSProvider(vultr.NewDNSProvider())
-	default:
-		return nil, nil, errors.Errorf("Unknown provider %v", provider)
+		k8s:               K8sClient{c: k8s, certClient: certClient},
+		acmeURL:           acmeURL,
+		certSecretPrefix:  certSecretPrefix,
+		certNamespace:     certNamespace,
+		tagPrefix:         tagPrefix,
+		namespaces:        namespaces,
+		class:             class,
+		defaultBackoff:    defaultBackoff,
+		defaultMaxBackoff: defaultMaxBackoff,
+		defaultProvider:   defaultProvider,
+		defaultEmail:      defaultEmail,
+		db:                db,
+		rateLimits:        make(map[string]*certBackoff, 0),
+		renewBeforeDays:   renewBeforeDays,
 	}
 }
 
@@ -177,77 +134,15 @@ func (p *CertProcessor) syncCertificates() error {
 		wg.Add(1)
 		go func(cert Certificate) {
 			defer wg.Done()
-			_, err := p.processCertificate(cert)
-			if err != nil {
+			if _, err := p.processCertificate(cert); err != nil {
 				log.Printf("Error while processing certificate during sync: %v", err)
+				return
 			}
 		}(cert)
 	}
 	wg.Wait()
+
 	return nil
-}
-
-func (p *CertProcessor) getSecrets() ([]v1.Secret, error) {
-	var secrets []v1.Secret
-	if len(p.namespaces) == 0 {
-		var err error
-		secrets, err = p.k8s.getSecrets(v1.NamespaceAll, p.getLabelSelector())
-		if err != nil {
-			return nil, errors.Wrap(err, "Error while fetching secret list")
-		}
-	} else {
-		for _, namespace := range p.namespaces {
-			s, err := p.k8s.getSecrets(namespace, p.getLabelSelector())
-			if err != nil {
-				return nil, errors.Wrap(err, "Error while fetching secret list")
-			}
-			secrets = append(secrets, s...)
-		}
-	}
-	return secrets, nil
-}
-
-func (p *CertProcessor) getCertificates() ([]Certificate, error) {
-	var certificates []Certificate
-	if len(p.namespaces) == 0 {
-		var err error
-		certificates, err = p.k8s.getCertificates(v1.NamespaceAll, p.getLabelSelector())
-		if err != nil {
-			return nil, errors.Wrap(err, "Error while fetching certificate list")
-		}
-	} else {
-		for _, namespace := range p.namespaces {
-			certs, err := p.k8s.getCertificates(namespace, p.getLabelSelector())
-			if err != nil {
-				return nil, errors.Wrap(err, "Error while fetching certificate list")
-			}
-			certificates = append(certificates, certs...)
-		}
-	}
-	return certificates, nil
-}
-
-func (p *CertProcessor) getIngresses() ([]v1beta1.Ingress, error) {
-	var ingresses []v1beta1.Ingress
-	if len(p.namespaces) == 0 {
-		var err error
-		if err != nil {
-			return nil, errors.Wrap(err, "Error creating API URL for ingress list")
-		}
-		ingresses, err = p.k8s.getIngresses(v1.NamespaceAll, p.getLabelSelector())
-		if err != nil {
-			return nil, errors.Wrap(err, "Error while fetching ingress list")
-		}
-	} else {
-		for _, namespace := range p.namespaces {
-			igs, err := p.k8s.getIngresses(namespace, p.getLabelSelector())
-			if err != nil {
-				return nil, errors.Wrap(err, "Error while fetching ingress list")
-			}
-			ingresses = append(ingresses, igs...)
-		}
-	}
-	return ingresses, nil
 }
 
 func (p *CertProcessor) syncIngresses() error {
@@ -335,6 +230,70 @@ func (p *CertProcessor) secretName(cert Certificate) string {
 	return p.certSecretPrefix + cert.Spec.Domain
 }
 
+// newACMEClient creates a new acme cliennt from the provider
+func (p *CertProcessor) newACMEClient(acmeUser acme.User, provider string) (*acme.Client, *sync.Mutex, error) {
+	acmeClient, err := acme.NewClient(p.acmeURL, acmeUser, acme.RSA2048)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "Error while generating acme client")
+	}
+
+	initDNSProvider := func(p acme.ChallengeProvider, err error) (*acme.Client, *sync.Mutex, error) {
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "Error while initializing challenge provider %v", provider)
+		}
+
+		if err := acmeClient.SetChallengeProvider(acme.DNS01, p); err != nil {
+			return nil, nil, errors.Wrapf(err, "Error while setting challenge provider %v for dns-01", provider)
+		}
+
+		acmeClient.ExcludeChallenges([]acme.Challenge{acme.HTTP01, acme.TLSSNI01})
+		return acmeClient, nil, nil
+	}
+
+	switch provider {
+	case "http":
+		acmeClient.SetHTTPAddress(":8080")
+		acmeClient.ExcludeChallenges([]acme.Challenge{acme.DNS01, acme.TLSSNI01})
+		return acmeClient, &p.HTTPLock, nil
+	case "tls":
+		acmeClient.SetTLSAddress(":8081")
+		acmeClient.ExcludeChallenges([]acme.Challenge{acme.HTTP01, acme.DNS01})
+		return acmeClient, &p.TLSLock, nil
+	case "cloudflare":
+		return initDNSProvider(cloudflare.NewDNSProvider())
+	case "digitalocean":
+		return initDNSProvider(digitalocean.NewDNSProvider())
+	case "dnsimple":
+		return initDNSProvider(dnsimple.NewDNSProvider())
+	case "dnsmadeeasy":
+		return initDNSProvider(dnsmadeeasy.NewDNSProvider())
+	case "dnspod":
+		return initDNSProvider(dnspod.NewDNSProvider())
+	case "dyn":
+		return initDNSProvider(dyn.NewDNSProvider())
+	case "gandi":
+		return initDNSProvider(gandi.NewDNSProvider())
+	case "googlecloud":
+		return initDNSProvider(googlecloud.NewDNSProvider())
+	case "linode":
+		return initDNSProvider(linode.NewDNSProvider())
+	case "namecheap":
+		return initDNSProvider(namecheap.NewDNSProvider())
+	case "ovh":
+		return initDNSProvider(ovh.NewDNSProvider())
+	case "pdns":
+		return initDNSProvider(pdns.NewDNSProvider())
+	case "rfc2136":
+		return initDNSProvider(rfc2136.NewDNSProvider())
+	case "route53":
+		return initDNSProvider(route53.NewDNSProvider())
+	case "vultr":
+		return initDNSProvider(vultr.NewDNSProvider())
+	default:
+		return nil, nil, errors.Errorf("Unknown provider %v", provider)
+	}
+}
+
 // normalizeHostnames returns a copy of the hostnames array where all hostnames are lower
 // cased and the array sorted.
 // This allows the input to have changed order or different casing between runs,
@@ -383,10 +342,42 @@ func equalAltNames(a, b []string) bool {
 	return true
 }
 
-// processCertificate creates or renews the corresponding secret
-// processCertificate will create new ACME users if necessary, and complete ACME challenges
-// processCertificate caches ACME user and certificate information in boltdb for reuse
+// processCertificate handles the custom error handling on the request
 func (p *CertProcessor) processCertificate(cert Certificate) (processed bool, err error) {
+	hostname := cert.Spec.Domain
+
+	// @check if this certificate is on a backoff condition
+	limit, found := p.isCertificateRated(hostname)
+	if found && time.Now().Before(limit.Permitted) {
+		return false, fmt.Errorf("Request for: '%s' is presently in backoff for: %s", hostname, limit.Permitted.Sub(time.Now()).String())
+	}
+
+	// @step: attempt to process the certificate
+	fetched, err := p.acquireCertificate(cert)
+	if err != nil {
+		if p.defaultBackoff <= 0 {
+			return false, err
+		}
+		switch found {
+		case true:
+			limit.Permitted = limit.Permitted.Add(limit.Rate.Duration())
+		default:
+			req := &certBackoff{Rate: &backoff.Backoff{Factor: 2, Max: p.defaultMaxBackoff, Min: p.defaultBackoff}}
+			req.Permitted = time.Now().Add(req.Rate.Duration())
+			p.addCertificateRate(hostname, req)
+		}
+
+		return false, err
+	}
+
+	p.removeCertificateRate(hostname)
+
+	return fetched, err
+}
+
+// acquireCertificate creates or renews the corresponding secret; it will create new ACME users if necessary
+// and complete ACME challenges, caches ACME user and certificate information in boltdb for reuse
+func (p *CertProcessor) acquireCertificate(cert Certificate) (bool, error) {
 	var (
 		acmeUserInfo    ACMEUserData
 		acmeCertDetails ACMECertDetails
@@ -777,6 +768,7 @@ func certificateNamespace(c Certificate) string {
 	if c.Metadata.Namespace != "" {
 		return c.Metadata.Namespace
 	}
+
 	return "default"
 }
 
@@ -793,6 +785,32 @@ func (p *CertProcessor) getLabelSelector() labels.Selector {
 		return labels.NewSelector().Add(*r)
 	}
 	return nil
+}
+
+// isCertificateRated checks if the certificate hostname has a certificate rate
+func (p *CertProcessor) isCertificateRated(hostname string) (*certBackoff, bool) {
+	p.rateLock.RLock()
+	defer p.rateLock.RUnlock()
+
+	rate, found := p.rateLimits[hostname]
+
+	return rate, found
+}
+
+// addCertificateRate adds a certificate rate to the hostname
+func (p *CertProcessor) addCertificateRate(hostname string, rate *certBackoff) {
+	p.rateLock.Lock()
+	defer p.rateLock.Unlock()
+
+	p.rateLimits[hostname] = rate
+}
+
+// removeCertificateRate removes the rate froma hostname
+func (p *CertProcessor) removeCertificateRate(hostname string) {
+	p.rateLock.Lock()
+	defer p.rateLock.Unlock()
+
+	delete(p.rateLimits, hostname)
 }
 
 func addTagPrefix(prefix, tag string) string {
