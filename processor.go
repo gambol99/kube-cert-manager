@@ -100,8 +100,9 @@ func NewCertProcessor(
 	}
 }
 
-func (p *CertProcessor) newACMEClient(acmeUser acme.User, provider string) (*acme.Client, *sync.Mutex, error) {
-	acmeClient, err := acme.NewClient(p.acmeURL, acmeUser, acme.RSA2048)
+// newACMEClient is responsible for creating a new acme client
+func (p *CertProcessor) newACMEClient(acmeUser acme.User, provider, acmeURL string) (*acme.Client, *sync.Mutex, error) {
+	acmeClient, err := acme.NewClient(acmeURL, acmeUser, acme.RSA2048)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "Error while generating acme client")
 	}
@@ -450,6 +451,7 @@ func (p *CertProcessor) processCertificate(cert Certificate) (processed bool, er
 
 	provider := valueOrDefault(cert.Spec.Provider, p.defaultProvider)
 	email := valueOrDefault(cert.Spec.Email, p.defaultEmail)
+	acmeURL := valueOrDefault(cert.Spec.AcmeURL, p.acmeURL)
 
 	// Handle user information
 	if userInfoRaw != nil { // Use existing user
@@ -458,7 +460,7 @@ func (p *CertProcessor) processCertificate(cert Certificate) (processed bool, er
 		}
 
 		log.Printf("Creating ACME client for %v provider for %v", provider, cert.Spec.Domain)
-		acmeClient, acmeClientMutex, err = p.newACMEClient(&acmeUserInfo, provider)
+		acmeClient, acmeClientMutex, err = p.newACMEClient(&acmeUserInfo, provider, acmeURL)
 		if err != nil {
 			return false, errors.Wrapf(err, "Error while creating ACME client for %v provider for %v", provider, cert.Spec.Domain)
 		}
@@ -481,7 +483,7 @@ func (p *CertProcessor) processCertificate(cert Certificate) (processed bool, er
 		})
 
 		log.Printf("Creating ACME client for %v provider for %v", provider, cert.Spec.Domain)
-		acmeClient, acmeClientMutex, err = p.newACMEClient(&acmeUserInfo, provider)
+		acmeClient, acmeClientMutex, err = p.newACMEClient(&acmeUserInfo, provider, acmeURL)
 		if err != nil {
 			return false, errors.Wrapf(err, "Error while creating ACME client for %v", cert.Spec.Domain)
 		}
@@ -705,8 +707,11 @@ func (p *CertProcessor) processIngress(ingress v1beta1.Ingress) {
 		Component: "kube-cert-manager",
 	}
 	var certs []Certificate
-	provider := valueOrDefault(ingress.Annotations[addTagPrefix(p.tagPrefix, "provider")], p.defaultProvider)
+
+	acmeURL := valueOrDefault(ingress.Annotations[addTagPrefix(p.tagPrefix, "acme-url")], p.acmeURL)
 	email := valueOrDefault(ingress.Annotations[addTagPrefix(p.tagPrefix, "email")], p.defaultEmail)
+	provider := valueOrDefault(ingress.Annotations[addTagPrefix(p.tagPrefix, "provider")], p.defaultProvider)
+
 	for _, tls := range ingress.Spec.TLS {
 		if len(tls.Hosts) == 0 {
 			continue
@@ -721,11 +726,12 @@ func (p *CertProcessor) processIngress(ingress v1beta1.Ingress) {
 				Namespace: ingress.Namespace,
 			},
 			Spec: CertificateSpec{
-				Domain:     tls.Hosts[0],
-				Provider:   provider,
-				Email:      email,
-				SecretName: tls.SecretName,
+				AcmeURL:    acmeURL,
 				AltNames:   altNames,
+				Domain:     tls.Hosts[0],
+				Email:      email,
+				Provider:   provider,
+				SecretName: tls.SecretName,
 			},
 		}
 		certs = append(certs, cert)

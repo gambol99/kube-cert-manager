@@ -7,6 +7,8 @@ metadata:
   annotations:
     stable.k8s.psg.io/kcm.provider: "googlecloud"
     stable.k8s.psg.io/kcm.email: "admin@psg.io"
+    # you can oveerride the acme endpoint from the default via the below annotation
+    #stable.k8s.psg.io/kcm.acme-url: "https://acme-staging-v02.api.letsencrypt.org/directory"
 spec:
   tls:
   - hosts:

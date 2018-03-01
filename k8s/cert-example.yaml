@@ -5,6 +5,8 @@ metadata:
   labels:
     stable.k8s.psg.io/kcm.class: "default"
 spec:
+  # you can override the acme endpoint from the deployment default
+  acmeURL: https://acme-staging-v02.api.letsencrypt.org/directory
   domain: "psg.io"
   email: "admin@psg.io"
   provider: "googlecloud"

@@ -113,6 +113,7 @@ func (cl *CertificateList) UnmarshalJSON(data []byte) error {
 }
 
 type CertificateSpec struct {
+	AcmeURL    string   `json:"acmeURL"`
 	Domain     string   `json:"domain"`
 	Provider   string   `json:"provider"`
 	Email      string   `json:"email"`
